@@ -1,0 +1,8 @@
+# requirements.txt
+fastapi
+uvicorn
+easyocr
+numpy
+Pillow
+opencv-python
+python-multipart
