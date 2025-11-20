@@ -42,8 +42,7 @@ if not API_SECRET_KEY:
 CPU_COUNT = float(os.environ.get("CLOUD_RUN_VCPU", "1"))        # Örn: 1
 MEMORY_GB = float(os.environ.get("CLOUD_RUN_MEMORY_GB", "2"))   # Örn: 2
 
-# Birim maliyetleri env ile override edilebilir;
-# yoksa europe-west1 Tier-1 varsayılanlarını kullan.
+# Birim maliyetler (europe-west1 varsayılan). İstersen env ile override edebilirsin.
 CPU_PRICE_PER_SECOND = float(os.environ.get("CPU_PRICE_PER_SECOND", "0.000024"))
 MEM_PRICE_PER_GIB_SECOND = float(os.environ.get("MEM_PRICE_PER_GIB_SECOND", "0.0000025"))
 
@@ -76,6 +75,27 @@ def get_reader():
 # Yardımcı Fonksiyonlar
 # ---------------------------------------------------------
 
+def run_ocr_with_conf(ocr_reader, image_np, min_conf: float = 0.45) -> str:
+    """
+    EasyOCR sonuçlarını güven skoruna göre filtreler.
+    - detail=1 ile bbox, text, conf alıyoruz
+    - conf < min_conf olanları atıyoruz
+    """
+    results = ocr_reader.readtext(image_np, detail=1)
+    kept_texts = []
+
+    for _, text, conf in results:
+        # Boş/gereksiz whitespace temizliği
+        t = (text or "").strip()
+        if not t:
+            continue
+        if conf < min_conf:
+            continue
+        kept_texts.append(t)
+
+    return " ".join(kept_texts)
+
+
 def find_highlighted_areas(
     image_np,
     min_area: int = 300,
@@ -98,15 +118,13 @@ def find_highlighted_areas(
     image_cv = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
     hsv = cv2.cvtColor(image_cv, cv2.COLOR_BGR2HSV)
 
-    # Renk aralıklarını biraz daha geniş tuttum, lacivert & fosforlu sarı daha iyi yakalansın.
+    # Renk aralıkları (lacivert ve fosforlu sarıyı yakalamak için geniş tutuldu)
     color_ranges = {
         "red1": ([0, 60, 40], [10, 255, 255]),
         "red2": ([170, 60, 40], [180, 255, 255]),
-        # mavi / lacivert highlighter: hue aralığını genişlettim, V alt sınırını düşürdüm
-        "blue": ([80, 40, 20], [140, 255, 255]),
+        "blue": ([80, 40, 20], [140, 255, 255]),      # mavi / lacivert
         "green": ([35, 40, 30], [85, 255, 255]),
-        # fosforlu sarı & turuncu tonları: S ve V alt limitlerini biraz esnettim
-        "yellow": ([15, 40, 40], [50, 255, 255]),
+        "yellow": ([15, 40, 40], [50, 255, 255]),     # fosforlu sarı
     }
 
     regions = []
@@ -154,7 +172,7 @@ def find_highlighted_areas(
             if per_color_count >= max_regions_per_color:
                 break
 
-        # Debug amaçlı: her renk için kaç kontur bulunduğunu logla
+        # Debug: her renk için kaç kontur bulundu
         logger.info(
             json.dumps(
                 {
@@ -282,7 +300,7 @@ async def analiz_et(
     highlighted_regions_results = []
     total_highlight_ocr_time = 0.0
 
-    # Her bölge için ayrı OCR
+    # Her bölge için ayrı OCR (confidence filtresi ile)
     for idx, region in enumerate(regions):
         cropped_img_np = region["crop"]
         bbox = region["bbox"]
@@ -290,29 +308,26 @@ async def analiz_et(
         area = region["area"]
 
         t1 = time.perf_counter()
-        res = ocr_reader.readtext(cropped_img_np, detail=0)
+        text = run_ocr_with_conf(ocr_reader, cropped_img_np, min_conf=0.45)
         dt = time.perf_counter() - t1
         total_highlight_ocr_time += dt
-
-        text = " ".join(res)
 
         highlighted_regions_results.append(
             {
                 "index": idx,
                 "color": color_name,
                 "area": int(area),
-                "text": text if text else "",
+                "text": text,
                 "bbox_pixels": bbox,
                 "ocr_success": True if text else False,
                 "ocr_ms": int(dt * 1000),
             }
         )
 
-    # 3. Tüm sayfa OCR
+    # 3. Tüm sayfa OCR (tam bağlam için)
     t2 = time.perf_counter()
-    raw_res = ocr_reader.readtext(image_np, detail=0)
+    full_text = run_ocr_with_conf(ocr_reader, image_np, min_conf=0.45)
     t_full_ocr = time.perf_counter() - t2
-    full_text = " ".join(raw_res)
 
     # 4. Analiz için bağlam
     successful_highlights = [
@@ -366,29 +381,13 @@ async def analiz_et(
     # -----------------------------------------------------
     # Response
     # -----------------------------------------------------
-
-    if highlighted_regions_results:
-        first_region = highlighted_regions_results[0]
-        backward_compat_highlight = {
-            "text": first_region["text"] or "İşaretli alan tespit edildi.",
-            "bbox_pixels": first_region["bbox_pixels"],
-            "ocr_success": first_region["ocr_success"],
-            "color": first_region["color"],
-        }
-    else:
-        backward_compat_highlight = {
-            "text": "İşaretli alan tespit edilemedi.",
-            "bbox_pixels": None,
-            "ocr_success": False,
-            "color": None,
-        }
+    # NOT: Artık sadece "highlighted_areas" dönüyoruz, tekil "highlighted_area" kaldırıldı.
 
     return {
         "status": "SUCCESS",
         "issue_category": issue_category,
         "extracted_variables": key_vars,
         "highlighted_areas": highlighted_regions_results,
-        "highlighted_area": backward_compat_highlight,
         "full_document_ocr": full_text,
         "metrics": {
             "total_ms": int(total_elapsed * 1000),
