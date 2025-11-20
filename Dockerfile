@@ -1,5 +1,4 @@
 # Dockerfile (güncel)
-
 FROM python:3.9-slim
 
 # EasyOCR / OpenCV için gerekli sistem paketleri
