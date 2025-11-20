@@ -7,6 +7,7 @@ import time
 import json
 import logging
 
+
 from fastapi import FastAPI, File, UploadFile, Header, HTTPException
 from fastapi.responses import JSONResponse
 
@@ -14,6 +15,13 @@ import easyocr
 import numpy as np
 from PIL import Image
 import cv2
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message=".*pin_memory.*",
+    category=UserWarning
+)
+
 
 # ---------------------------------------------------------
 # LOG AYARI
