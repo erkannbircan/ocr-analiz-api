@@ -34,8 +34,18 @@ if not API_SECRET_KEY:
         "Lütfen Cloud Run servisinde Environment Variables kısmına ekleyin."
     )
 
-# vCPU sayısını env'den okumak (yoksa 2 kabul et)
-CPU_COUNT = float(os.environ.get("CLOUD_RUN_VCPU", "2"))
+# ---------------------------------------------------------
+# DİNAMİK KAYNAK VE FİYAT AYARLARI
+# ---------------------------------------------------------
+
+# vCPU ve Memory değerlerini env'den oku (Cloud Run Container > Variables)
+CPU_COUNT = float(os.environ.get("CLOUD_RUN_VCPU", "1"))        # Örn: 1
+MEMORY_GB = float(os.environ.get("CLOUD_RUN_MEMORY_GB", "2"))   # Örn: 2
+
+# Birim maliyetleri env ile override edilebilir;
+# yoksa europe-west1 Tier-1 varsayılanlarını kullan.
+CPU_PRICE_PER_SECOND = float(os.environ.get("CPU_PRICE_PER_SECOND", "0.000024"))
+MEM_PRICE_PER_GIB_SECOND = float(os.environ.get("MEM_PRICE_PER_GIB_SECOND", "0.0000025"))
 
 app = FastAPI()
 
@@ -68,7 +78,7 @@ def get_reader():
 
 def find_highlighted_areas(
     image_np,
-    min_area: int = 400,
+    min_area: int = 300,
     max_regions_per_color: int = 10,
 ):
     """
@@ -76,18 +86,27 @@ def find_highlighted_areas(
     ve her renk için bulunan tüm alanları döndürür.
 
     Dönüş:
-      List[{"crop": np.ndarray, "bbox": (x1, y1, x2, y2), "color": str, "area": float}]
+      List[
+        {
+          "crop": np.ndarray,
+          "bbox": (x1, y1, x2, y2),
+          "color": str,
+          "area": float,
+        }
+      ]
     """
     image_cv = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
     hsv = cv2.cvtColor(image_cv, cv2.COLOR_BGR2HSV)
 
-    # Renk aralıklarını biraz geniş tuttum, lacivert / koyu sarı vb. de girsin diye.
+    # Renk aralıklarını biraz daha geniş tuttum, lacivert & fosforlu sarı daha iyi yakalansın.
     color_ranges = {
-        "red1": ([0, 70, 70], [10, 255, 255]),
-        "red2": ([170, 70, 70], [180, 255, 255]),
-        "blue": ([95, 60, 40], [135, 255, 255]),      # mavi / lacivert highlighter
-        "green": ([35, 50, 40], [85, 255, 255]),
-        "yellow": ([15, 60, 80], [45, 255, 255]),     # fosforlu sarı / turuncu tonları
+        "red1": ([0, 60, 40], [10, 255, 255]),
+        "red2": ([170, 60, 40], [180, 255, 255]),
+        # mavi / lacivert highlighter: hue aralığını genişlettim, V alt sınırını düşürdüm
+        "blue": ([80, 40, 20], [140, 255, 255]),
+        "green": ([35, 40, 30], [85, 255, 255]),
+        # fosforlu sarı & turuncu tonları: S ve V alt limitlerini biraz esnettim
+        "yellow": ([15, 40, 40], [50, 255, 255]),
     }
 
     regions = []
@@ -98,16 +117,14 @@ def find_highlighted_areas(
 
         mask = cv2.inRange(hsv, lower_hsv, upper_hsv)
 
-        # Küçük gürültüleri temizle, ama bölgeleri birleştirmemek için kernel küçük
+        # Küçük gürültüleri temizle; kernel küçük kalsın ki ayrı alanlar birleşmesin
         kernel = np.ones((3, 3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
-        # Her maske için konturları ayrı ayrı bul
         contours, _ = cv2.findContours(
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
-        # Alanı büyükten küçüğe sırala, her renk için max_regions_per_color kadar al
         contours_sorted = sorted(contours, key=cv2.contourArea, reverse=True)
 
         per_color_count = 0
@@ -117,7 +134,7 @@ def find_highlighted_areas(
                 continue
 
             x, y, w, h = cv2.boundingRect(cnt)
-            pad = 8  # ufak padding
+            pad = 8
 
             x1, y1 = max(0, x - pad), max(0, y - pad)
             x2, y2 = min(image_np.shape[1], x + w + pad), min(image_np.shape[0], y + h + pad)
@@ -137,7 +154,19 @@ def find_highlighted_areas(
             if per_color_count >= max_regions_per_color:
                 break
 
-    # Ekranda yukarıdan aşağıya, soldan sağa sıralama
+        # Debug amaçlı: her renk için kaç kontur bulunduğunu logla
+        logger.info(
+            json.dumps(
+                {
+                    "event": "color_mask_stats",
+                    "color": color_name,
+                    "contour_count": len(contours),
+                },
+                ensure_ascii=False,
+            )
+        )
+
+    # Yukarıdan aşağıya, soldan sağa sırala
     regions.sort(key=lambda r: (r["bbox"][1], r["bbox"][0]))
     return regions
 
@@ -175,6 +204,35 @@ def extract_key_variables(text):
         variables["EMAIL"] = email_match.group(0)
 
     return variables
+
+
+def estimate_cost(total_seconds: float) -> dict:
+    """
+    Toplam istek süresine göre CPU & Memory maliyet tahmini yapar.
+
+    Dönüş:
+      {
+        "cpu_seconds": float,
+        "memory_gib_seconds": float,
+        "cpu_cost_usd": float,
+        "memory_cost_usd": float,
+        "total_cost_usd": float
+      }
+    """
+    cpu_seconds = total_seconds * CPU_COUNT
+    memory_gib_seconds = total_seconds * MEMORY_GB
+
+    cpu_cost = cpu_seconds * CPU_PRICE_PER_SECOND
+    mem_cost = memory_gib_seconds * MEM_PRICE_PER_GIB_SECOND
+    total_cost = cpu_cost + mem_cost
+
+    return {
+        "cpu_seconds": cpu_seconds,
+        "memory_gib_seconds": memory_gib_seconds,
+        "cpu_cost_usd": cpu_cost,
+        "memory_cost_usd": mem_cost,
+        "total_cost_usd": total_cost,
+    }
 
 
 # ---------------------------------------------------------
@@ -268,9 +326,9 @@ async def analiz_et(
     issue_category = categorize_issue(analysis_context)
     key_vars = extract_key_variables(analysis_context)
 
-    # 5. Süre / CPU tahmini
+    # 5. Süre / CPU & Memory tahmini + maliyet
     total_elapsed = time.perf_counter() - t_start_total
-    cpu_seconds_estimate = total_elapsed * CPU_COUNT
+    cost_info = estimate_cost(total_elapsed)
 
     # -----------------------------------------------------
     # Performans LOG kaydı (JSON formatında)
@@ -286,8 +344,11 @@ async def analiz_et(
             "highlight_ocr_total": int(total_highlight_ocr_time * 1000),
             "full_ocr": int(t_full_ocr * 1000),
         },
-        "cpu_seconds_estimate": cpu_seconds_estimate,
-        "cpu_count": CPU_COUNT,
+        "resources": {
+            "cpu_count": CPU_COUNT,
+            "memory_gb": MEMORY_GB,
+        },
+        "cost_estimate": cost_info,
         "highlight_regions_meta": [
             {
                 "index": r["index"],
@@ -331,7 +392,12 @@ async def analiz_et(
         "full_document_ocr": full_text,
         "metrics": {
             "total_ms": int(total_elapsed * 1000),
-            "cpu_seconds_estimate": cpu_seconds_estimate,
             "cpu_count": CPU_COUNT,
+            "memory_gb": MEMORY_GB,
+            "cpu_seconds_estimate": cost_info["cpu_seconds"],
+            "memory_gib_seconds_estimate": cost_info["memory_gib_seconds"],
+            "cpu_cost_usd": cost_info["cpu_cost_usd"],
+            "memory_cost_usd": cost_info["memory_cost_usd"],
+            "total_cost_usd": cost_info["total_cost_usd"],
         },
     }
