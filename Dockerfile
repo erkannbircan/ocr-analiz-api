@@ -1,24 +1,29 @@
-# Dockerfile
+# Dockerfile (güncel)
+
 FROM python:3.9-slim
 
-# Sistem bağımlılıklarını yükle (EasyOCR / OpenCV için gerekli)
+# EasyOCR / OpenCV için gerekli sistem paketleri
 RUN apt-get update && apt-get install -y \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
-# Çalışma dizinini ayarla
+# Çalışma dizini
 WORKDIR /app
 
-# Gereksinimleri kopyala ve yükle
+# Python bağımlılıkları
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Kod dosyasını kopyala
+# Uygulama dosyası
 COPY api_server.py .
 
-# Cloud Run PORT değişkeni
+# Cloud Run port
 ENV PORT=8080
 
-# Uvicorn ile FastAPI'yi 0.0.0.0:8080'de çalıştır
+# FastAPI + Uvicorn
 CMD ["uvicorn", "api_server:app", "--host", "0.0.0.0", "--port", "8080"]
