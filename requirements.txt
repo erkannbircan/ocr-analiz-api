@@ -1,8 +1,7 @@
-# requirements.txt
 fastapi
 uvicorn
+python-multipart
 easyocr
 numpy
 Pillow
-opencv-python
-python-multipart
+opencv-python-headless
